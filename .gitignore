@@ -1,0 +1,10 @@
+# 本地密钥，绝不进仓库
+.env
+
+# 静态部署副本 / 构建产物
+_gh_pages/
+
+# 依赖与系统文件
+node_modules/
+.DS_Store
+*.zip
