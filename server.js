@@ -19,6 +19,10 @@
  *   PORT          监听端口，默认 8080
  *   ADMIN_USER   后台账号，默认 AnHuann
  *   ADMIN_PASS   后台密码，必须来自环境变量或同目录 .env（不写进源码）
+ *   GH_TOKEN     GitHub Token（repo 权限）：启用后后台保存会同步提交到仓库，避免动态平台磁盘临时导致内容丢失
+ *   GH_OWNER     内容仓库所有者，默认 grainshun
+ *   GH_REPO      内容所在仓库，默认 anhuann-site
+ *   GH_BRANCH    分支，默认 main
  *   配置方式（任选其一）：
  *     - 在同目录建 .env 文件：ADMIN_PASS=你的密码   （推荐，.env 已被 .gitignore 忽略）
  *     - 或启动前设环境变量：set ADMIN_PASS=你的密码 （Windows）
@@ -36,6 +40,7 @@
 
 // 引入 Node 内置模块：HTTP 服务、文件系统、路径处理、加密（用于令牌与常量时间比较）
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -75,6 +80,57 @@ const DATA_JS = path.join(DATA_DIR, "assets", "js", "data.js");
 // 自动备份目录与保留份数
 const BACKUP_DIR = path.join(DATA_DIR, "backups");
 const BACKUP_KEEP = 5;
+
+// ---- GitHub 永久化 ----
+// 在 Render / Railway 等动态平台上磁盘是临时的，后台保存只写本地会在重启/重新部署后丢失。
+// 配置下面环境变量后，保存时会把最新 data.js 通过 GitHub API 提交回仓库，实现「永久保存」。
+//   GH_TOKEN   必填：有 repo 权限的 GitHub Token（在平台环境变量里设置，勿写进源码）
+//   GH_OWNER   可选：仓库所有者，默认 grainshun
+//   GH_REPO    可选：内容所在仓库，默认 anhuann-site
+//   GH_BRANCH  可选：分支，默认 main
+const GH_TOKEN = process.env.GH_TOKEN;
+const GH_OWNER = process.env.GH_OWNER || "grainshun";
+const GH_REPO = process.env.GH_REPO || "anhuann-site";
+const GH_BRANCH = process.env.GH_BRANCH || "main";
+const GH_PATH = "assets/js/data.js";
+
+/* 把最新 data.js 内容提交回 GitHub 仓库（覆盖式 PUT，需要现有文件 sha）。
+ * 返回 Promise；网络/鉴权失败会 reject，由调用方做 best-effort 处理。 */
+function commitToGitHub(contentUtf8) {
+  return new Promise((resolve, reject) => {
+    if (!GH_TOKEN) return reject(new Error("GH_TOKEN 未配置"));
+    const auth = { Authorization: "Bearer " + GH_TOKEN, "User-Agent": "anhuann-server", Accept: "application/vnd.github+json" };
+    const getReq = https.request(
+      { hostname: "api.github.com", path: `/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_PATH}?ref=${GH_BRANCH}`, method: "GET", headers: auth },
+      (ghRes) => {
+        let buf = "";
+        ghRes.on("data", (c) => (buf += c));
+        ghRes.on("end", () => {
+          if (ghRes.statusCode !== 200) return reject(new Error("获取 sha 失败 " + ghRes.statusCode));
+          let sha;
+          try { sha = JSON.parse(buf).sha; } catch (e) { return reject(e); }
+          const putBody = JSON.stringify({ message: "content: update via admin", content: Buffer.from(contentUtf8, "utf8").toString("base64"), sha: sha, branch: GH_BRANCH });
+          const putReq = https.request(
+            { hostname: "api.github.com", path: `/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_PATH}`, method: "PUT", headers: Object.assign({}, auth, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(putBody) }) },
+            (putRes) => {
+              let pbuf = "";
+              putRes.on("data", (c) => (pbuf += c));
+              putRes.on("end", () => {
+                if (putRes.statusCode >= 200 && putRes.statusCode < 300) resolve(true);
+                else reject(new Error("提交失败 " + putRes.statusCode + " " + pbuf));
+              });
+            }
+          );
+          putReq.on("error", reject);
+          putReq.write(putBody);
+          putReq.end();
+        });
+      }
+    );
+    getReq.on("error", reject);
+    getReq.end();
+  });
+}
 
 /* =========================================================
  * 会话管理
@@ -577,7 +633,16 @@ function handleContent(req, res) {
         try {
           backupData(); // 写前先备份，防止误操作无法回退
           fs.mkdirSync(path.dirname(DATA_JS), { recursive: true });
-          fs.writeFileSync(DATA_JS, serializeData(body), "utf8");
+          const serialized = serializeData(body);
+          fs.writeFileSync(DATA_JS, serialized, "utf8");
+          // 永久化：把最新 data.js 提交回 GitHub（best-effort，失败不阻断本地保存）
+          if (GH_TOKEN) {
+            commitToGitHub(serialized)
+              .then(() => console.log("[github] data.js 已同步到仓库 " + GH_OWNER + "/" + GH_REPO))
+              .catch((e) => console.error("[github] 同步仓库失败（本地已保存）：", e.message));
+          } else {
+            console.warn("[github] 未配置 GH_TOKEN，保存仅在本机生效，重启可能丢失");
+          }
           sendJSON(res, 200, { ok: true });
         } catch (e) {
           sendJSON(res, 500, { ok: false, error: "写入失败" });
