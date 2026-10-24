@@ -1,0 +1,12 @@
+{
+  "name": "anhuann-site",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Anhuann 个人网站 + 可视化后台（Node 服务器）",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
